@@ -1,114 +1,116 @@
+import io
 from locale import normalize
+
+import urllib
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import json, requests, csv, io
+import json, requests, csv
 import gridly_api_handler
 
-# define the scope
-scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+# Define the scope and authorization
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 creds = ServiceAccountCredentials.from_json_keyfile_name('cred.json', scope)
 client = gspread.authorize(creds)
 
 
+import urllib.parse
+import json
+
 def updateCells(viewId, sheetUniqueIdColumn, gridlyApiKey, spreadSheetName):
+    column_mapping = gridly_api_handler.getGridlyColmnData(viewId, gridlyApiKey)
+    #print("Column mapping:", column_mapping)
     sheetUniqueIdColumn = int(sheetUniqueIdColumn)
-    global sheetTabs
-    sheetTabs = client.open(spreadSheetName)._spreadsheets_get()
-    steps = 100
-    startNumber = 0
-    untilNumber = 100   
-    url = "https://api.gridly.com/v1/views/"+viewId+"/records?page=%7B%22offset%22%3A+"+str(startNumber)+"%2C+%22limit%22%3A+"+str(untilNumber)+"%7D"
+    limit = 1000
+    offset = 0
+    records = []
 
-    payload={}
-    headers = {
-    'Authorization': 'ApiKey ' + gridlyApiKey
-    }    
+    headers = {'Authorization': f'ApiKey {gridlyApiKey}'}
+    url = f"https://api.gridly.com/v1/views/{viewId}/records"
 
-    response = requests.request("GET", url, headers=headers, data=payload)
-    records = json.loads(response.content)
-    while len(response.content) >= steps-1:
-        startNumber = untilNumber + 1
-        untilNumber = untilNumber + steps
-        url = "https://api.gridly.com/v1/views/"+viewId+"/records?page=%7B%22offset%22%3A+"+str(startNumber)+"%2C+%22limit%22%3A+"+str(untilNumber)+"%7D"
-        response = requests.request("GET", url, headers=headers, data=payload)
-        records += json.loads(response.content)
-        #print(len(json.loads(response.content)))
-    
-    #print(len(records))
+    # Get total count from headers and fetch records in pages
+    first_page_params = urllib.parse.quote(json.dumps({"offset": offset, "limit": limit}))
+    response = requests.get(f"{url}?page={first_page_params}", headers=headers)
+    total_count = int(response.headers.get('X-Total-Count', 0))
+    records.extend(response.json())
 
-    lastPathName = ""
-    lastTabId = 0
-    sheetHeaders = []
-    recordIds = []
-    _sheet = ""
-    updates = []
+    while len(records) < total_count:
+        offset += limit
+        next_page_params = urllib.parse.quote(json.dumps({"offset": offset, "limit": limit}))
+        response = requests.get(f"{url}?page={next_page_params}", headers=headers)
+        records.extend(response.json())
+
+    #print(len(records))  # Should now match X-Total-Count exactly
+
     sheet = client.open(spreadSheetName)
-    sheets = sheet._spreadsheets_get()["sheets"]
-    data = sheet.get_worksheet(0).get_all_records()
-    keys = list(data[0].keys())
-    sheetRecordIdAlias = keys[sheetUniqueIdColumn]
-    #for record in response:
-    lastPath = 9999
+    sheetTabs = {s['properties']['title']: s['properties']['index'] for s in sheet._spreadsheets_get()["sheets"]}
+
+    updates = []
+    current_sheet = None
+
     for record in records:
-        justChanged = False
-        value = ""
+        path_name = record["path"]
+        if path_name not in sheetTabs:
+            continue
 
-        if(lastPathName != record["path"]):
-            lastTabId = getTabIdByName(record["path"])
-            lastPathName = record["path"]
-            justChanged = True
-            _sheet = client.open(spreadSheetName).get_worksheet(lastTabId)
-            print("_sheet name: " + _sheet.title)
-        if(justChanged):
-            sheetAllRecord = _sheet.get_all_records()
-            sheetHeaders.clear()
-            recordIds.clear()
-            for key in sheetAllRecord[int(sheetUniqueIdColumn)]:
-                sheetHeaders.append(key)
-            for sheetRecord in sheetAllRecord:
-                recordIds.append(str(sheetRecord[sheetRecordIdAlias]))
-        for cell in record["cells"]:
-            normalized_sheet_headers = []
-            for sHeader in sheetHeaders:
-                normalized_sheet_headers.append(''.join(filter(str.isalnum, sHeader)))
-            #print(normalized_sheet_headers)
-            if "value" in cell:
-                value = cell["value"]
-            else:
-                value = ""
-
-            try:
-                row = recordIds.index(record["id"])+1
-                col = normalized_sheet_headers.index(cell["columnId"])
-            except:
-                continue
-
-            if lastPath == 9999:
-                lastPath = lastTabId
-            if lastPath != lastTabId:
-                _sheet = client.open(spreadSheetName).get_worksheet(lastPath)
-                _sheet.batch_update(updates)
+        if not current_sheet or current_sheet.title != path_name:
+            if updates:
+                send_batch_updates(current_sheet, updates)
                 updates = []
-                lastPath = lastTabId
+            current_sheet = sheet.get_worksheet(sheetTabs[path_name])
 
-            updates.append({'range': 'R['+str(row)+']C['+str(col)+']:R['+str(row)+']C['+str(col)+']', 'values':[[ value ]]})
-        
+            # Get headers and unique IDs for the current sheet
+            sheet_data = current_sheet.get_all_records()
+            if not sheet_data:
+                continue
+            sheet_headers = [key for key in sheet_data[0].keys()]
+            record_ids = [str(row[sheet_headers[sheetUniqueIdColumn]]) for row in sheet_data]
 
-    _sheet = client.open(spreadSheetName).get_worksheet(lastTabId)
-    _sheet.batch_update(updates)
+        try:
+            row = record_ids.index(record["id"]) + 2  # +2 to account for header row
+            row_values = [""] * len(sheet_headers)  # Initialize row values
 
-    #print(newUpdates)
+            for cell in record["cells"]:
+                
+                col_id = column_mapping[cell["columnId"]]
+                value = cell.get("value", "")
+                col = sheet_headers.index(col_id)
+                
+                
+                # Skip updating the unique ID column
+                if col != sheetUniqueIdColumn:
+                    row_values[col] = value
+                
+
+            # Adjust the range to exclude the unique ID column
+            update_range = f"{chr(65 + (sheetUniqueIdColumn + 1))}{row}:{chr(65 + len(sheet_headers) - 1)}{row}"
+            updates.append({
+                'range': update_range,
+                'values': [row_values[sheetUniqueIdColumn + 1:]]
+            })
+            
+
+        except ValueError:
+            continue
+
+    if updates:
+        send_batch_updates(current_sheet, updates)
 
 
+def send_batch_updates(sheet, updates, max_batch_size=1000):
+    """Batch updates by row to Google Sheets, with rate limiting if necessary."""
+    results = []
+    for i in range(0, len(updates), max_batch_size):
+        batch = updates[i:i + max_batch_size]
+        result = sheet.batch_update(batch)
+        results.append(result)
+        #print("Batch update result:", result)
 
-def getTabIdByName(tabName):
-    for sheet in sheetTabs["sheets"]:
-        if sheet["properties"]["title"] == tabName:
-            return sheet["properties"]["index"]
+    return results
 
 
 def pullSheet(event, context):
-    #event = json.loads(event)
+    #event = json.loads(event) uncomment if you want to trigger manuall from your pc
+
     sheetUniqueIdColumn = event["sheetUniqueIdColumn"]
     synchColumns = event["synchColumns"]
     spreadSheetName = event["spreadSheetName"]
@@ -117,9 +119,9 @@ def pullSheet(event, context):
     getSheetAsCSV(spreadSheetName, viewId, gridlyApiKey, synchColumns, sheetUniqueIdColumn)
 
 
-
 def pushSheet(event, context):
-    #event = json.loads(event)
+    #event = json.loads(event) uncomment if you want to trigger manuall from your pc
+    
     sheetUniqueIdColumn = event["sheetUniqueIdColumn"]
     synchColumns = event["synchColumns"]
     spreadSheetName = event["spreadSheetName"]
@@ -128,21 +130,18 @@ def pushSheet(event, context):
     updateCells(viewId, sheetUniqueIdColumn, gridlyApiKey, spreadSheetName)
 
 
-
 def getSheetAsCSV(spreadSheetName, viewId, gridlyApiKey, synchColumns, sheetUniqueIdColumn):
     sheet = client.open(spreadSheetName)
     sheets = sheet._spreadsheets_get()["sheets"]
-    for i in range(0, len(sheets), 1):
+    for i in range(len(sheets)):
         data = sheet.get_worksheet(i).get_all_records()
-        headers = []
-        for key in data[0]:
-            headers.append(key)
+        headers = list(data[0].keys())
         for item in data:
-            item.update( {"_pathTag":sheets[i]["properties"]["title"]})
+            item.update({"_pathTag": sheets[i]["properties"]["title"]})
 
         gridly_api_handler.importCSV(json_to_csv(data, int(sheetUniqueIdColumn)), headers, viewId, gridlyApiKey, synchColumns, ExcludedColumnName)
 
-    
+
 def json_to_csv(jsonFile, sheetUniqueIdColumn):
     keys = list(jsonFile[0].keys())
     global ExcludedColumnName
@@ -161,6 +160,10 @@ def json_to_csv(jsonFile, sheetUniqueIdColumn):
     
     # Get the CSV content as a string
     csv_content = output.getvalue()
-    
+
     return csv_content
 
+
+# Example call for manual testing
+#pushSheet("{\r\n\t\"gridlyApiKey\":\"YOURAPIKEY\",\r\n\r\n\t\"spreadSheetName\":\"YOURSPREADSHEETNAME\",\r\n\r\n\t\"viewId\":\"YOURVIEWID\",\r\n\r\n\t\"synchColumns\":\"true\",\r\n\r\n\t\"sheetUniqueIdColumn\":0\r\n}", "")
+#pullSheet("{\r\n\t\"gridlyApiKey\":\"YOURAPIKEY\",\r\n\t\"spreadSheetName\":\"YOURSPREADSHEETNAME\",\r\n\t\"viewId\":\"YOURVIEWID\",\r\n\t\"synchColumns\":\"true\",\r\n\t\"sheetUniqueIdColumn\":0\r\n}", "")

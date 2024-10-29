@@ -1,8 +1,12 @@
+import random
+import re
+import string
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 import json
 import os
 import time
+import urllib
 
 
 
@@ -40,7 +44,7 @@ def importCSV(mycsv, sheetHeaders, _viewId, _gridlyApiKEy, synchColumns, _Exclud
     'Content-Type': mp_encoder.content_type
     }
     importResponse = requests.request("POST", url, headers=headers, data=mp_encoder)
-    print(importResponse.text)
+    #print(importResponse.text)
     time.sleep(5)
 
 
@@ -64,9 +68,20 @@ def getGridlyHeaders():
         return None
     return columnNames
 
+def getGridlyColmnData(_viewId, _gridlyApiKEy):
+    url = "https://api.gridly.com/v1/views/" + _viewId
+
+    payload={}
+    headers = {
+    'Authorization': 'ApiKey ' + _gridlyApiKEy
+    }
+
+    data = json.loads(requests.request("GET", url, headers=headers, data=payload).content)
+    return {column["id"]: column["name"] for column in data["columns"]}
+
 
 def synchHeaders(sheetHeaders, ExcludedColumnName):
-    #print(ExcludedColumnName)
+    #print(sheetHeaders)
     gridlyHeaders = getGridlyHeaders()
     for sheetheader in sheetHeaders:
         if sheetheader not in gridlyHeaders and sheetheader != "_recordId" and sheetheader != "_pathTag" and sheetheader != ExcludedColumnName:
@@ -75,23 +90,32 @@ def synchHeaders(sheetHeaders, ExcludedColumnName):
 
 
 def createGridlyHeader(headerName):
+    #print(f"Try create new column for: {headerName}")
     refreshView()
     if "gridStatus" in view:
-        while(view["gridStatus"] != "active"):
+        while view["gridStatus"] != "active":
             time.sleep(30)
             refreshView()
 
-    url = "https://api.gridly.com/v1/views/" + viewId + "/columns"
-    id = ''.join(filter(str.isalnum, headerName))
-    payload = json.dumps({
-    "name": headerName,
-    "type": "multipleLines",
-    "id": id
-    })
+    url = f"https://api.gridly.com/v1/views/{viewId}/columns"
+    
+    # Check if headerName contains only valid characters; if not, generate a random ID
+    if re.search(r'[^a-zA-Z0-9_]', headerName):
+        id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    else:
+        id = headerName
+
+    payload = {
+        "name": headerName,   # UTF-8 compatible name
+        "type": "multipleLines",
+        "id": id              # Valid alphanumeric or generated ID
+    }
+    #print("Payload to send:", payload)
+    
     headers = {
-    'Authorization': 'ApiKey ' + gridlyApiKEy,
-    'Content-Type': 'application/json'
+        'Authorization': f'ApiKey {gridlyApiKEy}',
+        'Content-Type': 'application/json; charset=utf-8'
     }
 
-    response = requests.request("POST", url, headers=headers, data=payload)
-    #print(response.text)
+    response = requests.post(url, headers=headers, json=payload)
+    #print(response.text)  # Log response to check for any API-related errors
